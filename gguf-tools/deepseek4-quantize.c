@@ -45,6 +45,7 @@
 #define DS4_KV_QUANTIZE_IMATRIX_DATASET   "quantize.imatrix.dataset"
 #define DS4_KV_QUANTIZE_IMATRIX_N_ENTRIES "quantize.imatrix.entries_count"
 #define DS4_KV_QUANTIZE_IMATRIX_N_CHUNKS  "quantize.imatrix.chunks_count"
+#define DS4_KV_DEEPSEEK4_EXPERT_COUNT     "deepseek4.expert_count"
 #define DS4_GGUF_DEFAULT_ALIGNMENT 32
 
 typedef enum {
@@ -317,6 +318,30 @@ static int64_t json_i64(const json_doc *d, int tok) {
     memcpy(tmp, d->js + d->v[tok].start, (size_t)n);
     tmp[n] = '\0';
     return strtoll(tmp, NULL, 10);
+}
+
+static int hf_config_n_routed_experts(const char *hf_dir) {
+    char *path = path_join(hf_dir, "config.json");
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        free(path);
+        return 0;
+    }
+    fclose(fp);
+
+    size_t len = 0;
+    char *text = read_file(path, &len);
+    json_doc d = json_parse_text(text, len);
+    int out = 0;
+    int tok = json_obj_get(&d, 0, "n_routed_experts");
+    if (tok >= 0 && d.v[tok].type == JT_PRIMITIVE) {
+        int64_t n = json_i64(&d, tok);
+        if (n > 0 && n <= INT_MAX) out = (int)n;
+    }
+    json_free(&d);
+    free(text);
+    free(path);
+    return out;
 }
 
 /* =====
@@ -991,9 +1016,21 @@ typedef struct {
 } quant_policy;
 
 static bool is_attention_projection(const char *name) {
+    if (strstr(name, ".indexer.attn_q_b.weight")) return false;
     return strstr(name, ".attn_kv.weight") || strstr(name, ".attn_q_a.weight") ||
            strstr(name, ".attn_q_b.weight") || strstr(name, ".attn_output_a.weight") ||
            strstr(name, ".attn_output_b.weight");
+}
+
+static bool must_keep_template_type(const char *name) {
+    return strstr(name, ".attn_compressor_") ||
+           strstr(name, ".indexer.") ||
+           strstr(name, ".indexer_compressor_") ||
+           strstr(name, ".hc_attn_") ||
+           strstr(name, ".hc_ffn_") ||
+           strstr(name, ".ffn_gate_inp.weight") ||
+           strcmp(name, "token_embd.weight") == 0 ||
+           strcmp(name, "output_hc_fn.weight") == 0;
 }
 
 static bool is_attention_tensor(const char *name) {
@@ -1042,6 +1079,7 @@ static ds4q_type policy_type(const quant_policy *p, const char *name, const tens
         return tmpl->type;
     }
     if (tensor_n_dims(tmpl) <= 1) return tmpl->type;
+    if (must_keep_template_type(name)) return tmpl->type;
     if (strcmp(name, "token_embd.weight") == 0 && p->embedding != DS4Q_TYPE_COUNT) return p->embedding;
     if (is_output_tensor(name) && p->output != DS4Q_TYPE_COUNT) return p->output;
     if (is_shared_expert(name) && p->shared != DS4Q_TYPE_COUNT) return p->shared;
@@ -1433,6 +1471,17 @@ static uint64_t extra_imatrix_kv_count(const imatrix_store *im) {
     return 2 + (im->dataset ? 1 : 0) + (im->chunks > 0 ? 1 : 0);
 }
 
+static size_t expert_count_kv_size(void) {
+    return gguf_string_size(DS4_KV_DEEPSEEK4_EXPERT_COUNT) + 4 + 4;
+}
+
+static void write_expert_count_kv(FILE *fp, int n_experts) {
+    if (n_experts <= 0 || n_experts > INT32_MAX) die("bad routed expert count");
+    write_gguf_string(fp, DS4_KV_DEEPSEEK4_EXPERT_COUNT);
+    write_u32(fp, GGUF_TYPE_UINT32);
+    write_u32(fp, (uint32_t)n_experts);
+}
+
 static void write_imatrix_kvs(FILE *fp, const imatrix_store *im) {
     if (!imatrix_enabled(im)) return;
     write_gguf_string(fp, DS4_KV_QUANTIZE_IMATRIX_FILE);
@@ -1481,10 +1530,10 @@ static gguf_file load_gguf_metadata(const char *path) {
         if (strcmp(key, "general.alignment") == 0 && type == GGUF_TYPE_UINT32) {
             uint32_t a = read_u32_le_fp(fp, "GGUF alignment");
             if (a) g.alignment = a;
-        } else if (strcmp(key, "deepseek4.expert_count") == 0 && type == GGUF_TYPE_UINT32) {
+        } else if (strcmp(key, DS4_KV_DEEPSEEK4_EXPERT_COUNT) == 0 && type == GGUF_TYPE_UINT32) {
             uint32_t n = read_u32_le_fp(fp, "GGUF expert count");
             if (n <= (uint32_t)INT_MAX) g.n_experts = (int)n;
-        } else if (strcmp(key, "deepseek4.expert_count") == 0 && type == GGUF_TYPE_UINT64) {
+        } else if (strcmp(key, DS4_KV_DEEPSEEK4_EXPERT_COUNT) == 0 && type == GGUF_TYPE_UINT64) {
             uint64_t n = read_u64_le_fp(fp, "GGUF expert count");
             if (n <= (uint64_t)INT_MAX) g.n_experts = (int)n;
         } else {
@@ -1499,7 +1548,8 @@ static gguf_file load_gguf_metadata(const char *path) {
          * otherwise the output can contain duplicate GGUF metadata with stale
          * and new values.
          */
-        if (!is_imatrix_kv_key(key)) {
+        if (!is_imatrix_kv_key(key) &&
+            strcmp(key, DS4_KV_DEEPSEEK4_EXPERT_COUNT) != 0) {
             kv_keep[n_kv_keep++] = (byte_span){
                 .start = (size_t)(rec_start - kv_start),
                 .end = (size_t)(rec_end - kv_start),
@@ -1574,10 +1624,32 @@ static uint64_t fnv1a64_bytes(const uint8_t *data, size_t n) {
     return h;
 }
 
-static output_context build_output_context(const gguf_file *tmpl, const quant_policy *policy, const imatrix_store *im) {
+static void apply_reap_expert_dims(tensor_meta *t, int n_experts) {
+    if (n_experts <= 0) return;
+
+    expert_tensor e = parse_expert_tensor(t->name);
+    if (e.is_expert) {
+        if (t->n_dims != 3) die("routed expert tensor does not have rank 3");
+        t->ne[2] = n_experts;
+        return;
+    }
+
+    if (strstr(t->name, ".ffn_gate_inp.weight") != NULL) {
+        if (t->n_dims != 2) die("router gate tensor does not have rank 2");
+        t->ne[1] = n_experts;
+        return;
+    }
+
+    if (strstr(t->name, ".exp_probs_b.bias") != NULL) {
+        if (t->n_dims != 1) die("router bias tensor does not have rank 1");
+        t->ne[0] = n_experts;
+    }
+}
+
+static output_context build_output_context(const gguf_file *tmpl, const quant_policy *policy, const imatrix_store *im, int n_experts) {
     output_context out = {0};
     out.n_tensors = tmpl->n_tensors;
-    out.n_kv_extra = extra_imatrix_kv_count(im);
+    out.n_kv_extra = 1 + extra_imatrix_kv_count(im);
     out.alignment = tmpl->alignment;
     out.tensors = xcalloc((size_t)out.n_tensors, sizeof(out.tensors[0]));
     size_t tensor_info = 0;
@@ -1587,18 +1659,19 @@ static output_context build_output_context(const gguf_file *tmpl, const quant_po
         tensor_meta *dst = &out.tensors[i];
         *dst = *src;
         dst->name = src->name;
+        apply_reap_expert_dims(dst, n_experts);
         ds4q_type type = policy_type(policy, src->name, src);
         if (type == DS4Q_TYPE_COUNT) type = src->type;
         if (type != DS4Q_TYPE_I32 && !is_quantizable_target(type)) die("unsupported planned tensor type");
-        if (ds4q_can_quantize(type) && src->ne[0] % ds4q_block_size(type) != 0) die("ne[0] not divisible by block size");
+        if (ds4q_can_quantize(type) && dst->ne[0] % ds4q_block_size(type) != 0) die("ne[0] not divisible by block size");
         dst->type = type;
-        dst->size = tensor_nbytes(type, src->ne, src->n_dims);
+        dst->size = tensor_nbytes(type, dst->ne, dst->n_dims);
         dst->new_offset = off;
         off += ds4q_pad(dst->size, tmpl->alignment);
         tensor_info += gguf_string_size(dst->name) + 4 + (size_t)dst->n_dims * 8 + 4 + 8;
     }
     out.tensor_bytes = off;
-    out.meta_size = 4 + 4 + 8 + 8 + tmpl->kv_raw_len + extra_imatrix_kv_size(im) + tensor_info;
+    out.meta_size = 4 + 4 + 8 + 8 + tmpl->kv_raw_len + expert_count_kv_size() + extra_imatrix_kv_size(im) + tensor_info;
     out.data_offset = ds4q_pad(out.meta_size, tmpl->alignment);
     return out;
 }
@@ -1622,6 +1695,7 @@ static void write_full_gguf(st_db *db, const gguf_file *tmpl, const output_conte
     write_u64(fp, tmpl->n_tensors);
     write_u64(fp, tmpl->n_kv + out_ctx->n_kv_extra);
     if (fwrite(tmpl->kv_raw, 1, tmpl->kv_raw_len, fp) != tmpl->kv_raw_len) die("write GGUF KV failed");
+    write_expert_count_kv(fp, n_experts);
     write_imatrix_kvs(fp, imatrix);
     for (uint64_t i = 0; i < out_ctx->n_tensors; i++) {
         const tensor_meta *t = &out_ctx->tensors[i];
@@ -1637,10 +1711,9 @@ static void write_full_gguf(st_db *db, const gguf_file *tmpl, const output_conte
     write_padding(fp, out_ctx->data_offset - (size_t)pos);
 
     for (uint64_t i = 0; i < out_ctx->n_tensors; i++) {
-        const tensor_meta *src = &tmpl->tensors[i];
         const tensor_meta *dst = &out_ctx->tensors[i];
         fprintf(stderr, "[%4" PRIu64 "/%4" PRIu64 "] %s -> %s\n", i + 1, out_ctx->n_tensors, dst->name, ds4q_type_name(dst->type));
-        byte_buf data = generate_tensor(db, dst->name, src, dst->type, n_experts, n_threads, imatrix);
+        byte_buf data = generate_tensor(db, dst->name, dst, dst->type, n_experts, n_threads, imatrix);
         size_t expected = dst->size;
         if (data.size != expected) {
             fprintf(stderr, "error: generated size mismatch for %s: got %zu expected %zu\n", dst->name, data.size, expected);
@@ -1717,7 +1790,7 @@ static void usage(const char *argv0) {
     printf("  --output TYPE          output.* tensor type\n");
     printf("  --dense TYPE           remaining 2D+ non-routed tensor type\n");
     printf("  --tensor-type PFX=TYPE exact tensor-name or prefix override; may repeat\n");
-    printf("  --n-experts N          routed expert count, default template metadata\n");
+    printf("  --n-experts N          routed expert count, default HF config then template metadata\n");
     printf("  --threads N            expert worker count, default 8\n");
     printf("\nTYPE examples: f16, f32, bf16, q8_0, q4_k, q2_k, iq2_xxs\n");
 }
@@ -1831,7 +1904,7 @@ static void compare_one_tensor(st_db *db, const gguf_file *tmpl, const output_co
     }
     fprintf(stderr, "regenerating %s as %s\n",
             p->compare_tensor, ds4q_type_name(out_ctx->tensors[idx].type));
-    byte_buf generated = generate_tensor(db, p->compare_tensor, &tmpl->tensors[idx],
+    byte_buf generated = generate_tensor(db, p->compare_tensor, &out_ctx->tensors[idx],
                                          out_ctx->tensors[idx].type, p->n_experts, p->n_threads, imatrix);
     gguf_file ref = load_gguf_metadata(p->compare_gguf);
     byte_buf reference = read_gguf_tensor_data(&ref, p->compare_gguf, p->compare_tensor);
@@ -1871,7 +1944,11 @@ int main(int argc, char **argv) {
 
     gguf_file tmpl = load_gguf_metadata(p.template_gguf);
     if (p.n_experts <= 0) {
-        if (tmpl.n_experts > 0) {
+        int hf_experts = hf_config_n_routed_experts(p.hf_dir);
+        if (hf_experts > 0) {
+            p.n_experts = hf_experts;
+            fprintf(stderr, "using %d routed experts from HF config.json\n", p.n_experts);
+        } else if (tmpl.n_experts > 0) {
             p.n_experts = tmpl.n_experts;
             fprintf(stderr, "using %d routed experts from template metadata\n", p.n_experts);
         } else {
@@ -1881,7 +1958,7 @@ int main(int argc, char **argv) {
     } else {
         fprintf(stderr, "using %d routed experts from --n-experts\n", p.n_experts);
     }
-    output_context out_ctx = build_output_context(&tmpl, &p.policy, &imatrix);
+    output_context out_ctx = build_output_context(&tmpl, &p.policy, &imatrix, p.n_experts);
     print_plan(&tmpl, &out_ctx);
     if (p.dry_run) return 0;
 

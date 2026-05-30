@@ -1541,7 +1541,14 @@ extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_s
     if (!model_map || bytes == 0) return 1;
     if (offset > model_size || bytes > model_size - offset) return 0;
     if (!cuda_model_range_ptr(model_map, offset, bytes, label ? label : "model_tensor")) return 0;
-    return cuda_model_range_is_cached(model_map, offset, bytes);
+    if (!cuda_model_range_is_cached(model_map, offset, bytes) &&
+        getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+        fprintf(stderr,
+                "ds4: CUDA model range using direct fallback for %s %.2f MiB\n",
+                label ? label : "model_tensor",
+                (double)bytes / 1048576.0);
+    }
+    return 1;
 }
 
 extern "C" int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label) {
@@ -4207,29 +4214,32 @@ __global__ static void router_select_kernel(
         int32_t token_scalar,
         uint32_t hash_rows,
         uint32_t n_tokens,
+        uint32_t n_expert,
+        uint32_t n_expert_used,
+        float expert_weight_scale,
         int has_bias,
         int hash_mode) {
     uint32_t t = blockIdx.x;
     if (t >= n_tokens || threadIdx.x != 0) return;
-    const float *log = logits + (uint64_t)t * 256;
-    float *prob = probs + (uint64_t)t * 256;
-    int32_t *sel = selected + (uint64_t)t * 6;
-    float *w = weights + (uint64_t)t * 6;
+    const float *log = logits + (uint64_t)t * n_expert;
+    float *prob = probs + (uint64_t)t * n_expert;
+    int32_t *sel = selected + (uint64_t)t * n_expert_used;
+    float *w = weights + (uint64_t)t * n_expert_used;
 
-    for (int i = 0; i < 256; i++) prob[i] = sqrtf(softplus_dev(log[i]));
+    for (uint32_t i = 0; i < n_expert; i++) prob[i] = sqrtf(softplus_dev(log[i]));
 
     if (hash_mode) {
         int32_t tok = tokens ? tokens[t] : token_scalar;
         if (tok < 0 || (uint32_t)tok >= hash_rows) tok = 0;
-        const int32_t *row = hash + (uint64_t)tok * 6;
-        for (int i = 0; i < 6; i++) sel[i] = row[i];
+        const int32_t *row = hash + (uint64_t)tok * n_expert_used;
+        for (uint32_t i = 0; i < n_expert_used; i++) sel[i] = row[i];
     } else {
-        for (int i = 0; i < 6; i++) sel[i] = -1;
-        for (int i = 0; i < 256; i++) {
+        for (uint32_t i = 0; i < n_expert_used; i++) sel[i] = -1;
+        for (uint32_t i = 0; i < n_expert; i++) {
             float score = prob[i] + (has_bias ? bias[i] : 0.0f);
-            for (int j = 0; j < 6; j++) {
+            for (uint32_t j = 0; j < n_expert_used; j++) {
                 if (sel[j] < 0 || score > prob[sel[j]] + (has_bias ? bias[sel[j]] : 0.0f)) {
-                    for (int k = 5; k > j; k--) sel[k] = sel[k - 1];
+                    for (uint32_t k = n_expert_used - 1; k > j; k--) sel[k] = sel[k - 1];
                     sel[j] = i;
                     break;
                 }
@@ -4238,14 +4248,14 @@ __global__ static void router_select_kernel(
     }
 
     float sum = 0.0f;
-    for (int i = 0; i < 6; i++) {
+    for (uint32_t i = 0; i < n_expert_used; i++) {
         int e = sel[i];
-        float v = (e >= 0 && e < 256) ? prob[e] : 0.0f;
+        float v = (e >= 0 && (uint32_t)e < n_expert) ? prob[e] : 0.0f;
         w[i] = v;
         sum += v;
     }
     sum = fmaxf(sum, 6.103515625e-5f);
-    for (int i = 0; i < 6; i++) w[i] = w[i] / sum * 1.5f;
+    for (uint32_t i = 0; i < n_expert_used; i++) w[i] = w[i] / sum * expert_weight_scale;
 }
 
 __global__ static void router_select_parallel_kernel(
@@ -4259,35 +4269,41 @@ __global__ static void router_select_parallel_kernel(
         int32_t token_scalar,
         uint32_t hash_rows,
         uint32_t n_tokens,
+        uint32_t n_expert,
+        uint32_t n_expert_used,
+        float expert_weight_scale,
         int has_bias,
         int hash_mode) {
     uint32_t t = blockIdx.x;
     uint32_t i = threadIdx.x;
-    if (t >= n_tokens || i >= 256u) return;
-    const float *log = logits + (uint64_t)t * 256;
-    float *prob = probs + (uint64_t)t * 256;
-    int32_t *sel = selected + (uint64_t)t * 6;
-    float *w = weights + (uint64_t)t * 6;
+    if (t >= n_tokens) return;
+    const float *log = logits + (uint64_t)t * n_expert;
+    float *prob = probs + (uint64_t)t * n_expert;
+    int32_t *sel = selected + (uint64_t)t * n_expert_used;
+    float *w = weights + (uint64_t)t * n_expert_used;
     __shared__ float sprob[256];
 
-    const float p = sqrtf(softplus_dev(log[i]));
-    sprob[i] = p;
-    prob[i] = p;
+    const bool valid = i < n_expert;
+    const float p = valid ? sqrtf(softplus_dev(log[i])) : 0.0f;
+    if (valid) {
+        sprob[i] = p;
+        prob[i] = p;
+    }
     __syncthreads();
 
     if (i != 0) return;
     if (hash_mode) {
         int32_t tok = tokens ? tokens[t] : token_scalar;
         if (tok < 0 || (uint32_t)tok >= hash_rows) tok = 0;
-        const int32_t *row = hash + (uint64_t)tok * 6;
-        for (int j = 0; j < 6; j++) sel[j] = row[j];
+        const int32_t *row = hash + (uint64_t)tok * n_expert_used;
+        for (uint32_t j = 0; j < n_expert_used; j++) sel[j] = row[j];
     } else {
-        for (int j = 0; j < 6; j++) sel[j] = -1;
-        for (int e = 0; e < 256; e++) {
+        for (uint32_t j = 0; j < n_expert_used; j++) sel[j] = -1;
+        for (uint32_t e = 0; e < n_expert; e++) {
             float score = sprob[e] + (has_bias ? bias[e] : 0.0f);
-            for (int j = 0; j < 6; j++) {
+            for (uint32_t j = 0; j < n_expert_used; j++) {
                 if (sel[j] < 0 || score > sprob[sel[j]] + (has_bias ? bias[sel[j]] : 0.0f)) {
-                    for (int k = 5; k > j; k--) sel[k] = sel[k - 1];
+                    for (uint32_t k = n_expert_used - 1; k > j; k--) sel[k] = sel[k - 1];
                     sel[j] = e;
                     break;
                 }
@@ -4296,14 +4312,14 @@ __global__ static void router_select_parallel_kernel(
     }
 
     float sum = 0.0f;
-    for (int j = 0; j < 6; j++) {
+    for (uint32_t j = 0; j < n_expert_used; j++) {
         int e = sel[j];
-        float v = (e >= 0 && e < 256) ? sprob[e] : 0.0f;
+        float v = (e >= 0 && (uint32_t)e < n_expert) ? sprob[e] : 0.0f;
         w[j] = v;
         sum += v;
     }
     sum = fmaxf(sum, 6.103515625e-5f);
-    for (int j = 0; j < 6; j++) w[j] = w[j] / sum * 1.5f;
+    for (uint32_t j = 0; j < n_expert_used; j++) w[j] = w[j] / sum * expert_weight_scale;
 }
 
 __device__ __forceinline__ static bool router_score_better(float av, uint32_t ai, float bv, uint32_t bi) {
@@ -4321,6 +4337,9 @@ __global__ static void router_select_warp_topk_kernel(
         int32_t token_scalar,
         uint32_t hash_rows,
         uint32_t n_tokens,
+        uint32_t n_expert,
+        uint32_t n_expert_used,
+        float expert_weight_scale,
         int has_bias,
         int hash_mode) {
     const uint32_t lane = threadIdx.x;
@@ -4328,10 +4347,10 @@ __global__ static void router_select_warp_topk_kernel(
     const uint32_t t = blockIdx.x * blockDim.y + row_in_block;
     if (t >= n_tokens || lane >= 32u) return;
 
-    const float *log = logits + (uint64_t)t * 256u;
-    float *prob = probs + (uint64_t)t * 256u;
-    int32_t *sel = selected + (uint64_t)t * 6u;
-    float *w = weights + (uint64_t)t * 6u;
+    const float *log = logits + (uint64_t)t * n_expert;
+    float *prob = probs + (uint64_t)t * n_expert;
+    int32_t *sel = selected + (uint64_t)t * n_expert_used;
+    float *w = weights + (uint64_t)t * n_expert_used;
     __shared__ float sprob[4][256];
     float local_prob[8];
     float local_score[8];
@@ -4339,11 +4358,14 @@ __global__ static void router_select_warp_topk_kernel(
     #pragma unroll
     for (uint32_t j = 0; j < 8u; j++) {
         const uint32_t e = lane + j * 32u;
-        const float p = sqrtf(softplus_dev(log[e]));
+        const bool valid = e < n_expert;
+        const float p = valid ? sqrtf(softplus_dev(log[e])) : 0.0f;
         local_prob[j] = p;
-        local_score[j] = p + (has_bias ? bias[e] : 0.0f);
-        sprob[row_in_block][e] = p;
-        prob[e] = p;
+        local_score[j] = valid ? p + (has_bias ? bias[e] : 0.0f) : -INFINITY;
+        if (valid) {
+            sprob[row_in_block][e] = p;
+            prob[e] = p;
+        }
     }
     __syncwarp();
 
@@ -4351,27 +4373,24 @@ __global__ static void router_select_warp_topk_kernel(
         if (lane == 0) {
             int32_t tok = tokens ? tokens[t] : token_scalar;
             if (tok < 0 || (uint32_t)tok >= hash_rows) tok = 0;
-            const int32_t *row = hash + (uint64_t)tok * 6u;
+            const int32_t *row = hash + (uint64_t)tok * n_expert_used;
             float sum = 0.0f;
-            #pragma unroll
-            for (uint32_t j = 0; j < 6u; j++) {
+            for (uint32_t j = 0; j < n_expert_used; j++) {
                 const int32_t e = row[j];
                 sel[j] = e;
-                const float v = (e >= 0 && e < 256) ? sprob[row_in_block][(uint32_t)e] : 0.0f;
+                const float v = (e >= 0 && (uint32_t)e < n_expert) ? sprob[row_in_block][(uint32_t)e] : 0.0f;
                 w[j] = v;
                 sum += v;
             }
             sum = fmaxf(sum, 6.103515625e-5f);
-            #pragma unroll
-            for (uint32_t j = 0; j < 6u; j++) w[j] = w[j] / sum * 1.5f;
+            for (uint32_t j = 0; j < n_expert_used; j++) w[j] = w[j] / sum * expert_weight_scale;
         }
         return;
     }
 
     float out_prob[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     uint32_t out_idx[6] = {0, 0, 0, 0, 0, 0};
-    #pragma unroll
-    for (uint32_t k = 0; k < 6u; k++) {
+    for (uint32_t k = 0; k < n_expert_used; k++) {
         float best_score = -INFINITY;
         float best_prob = 0.0f;
         uint32_t best_idx = UINT32_MAX;
@@ -4409,15 +4428,13 @@ __global__ static void router_select_warp_topk_kernel(
 
     if (lane == 0) {
         float sum = 0.0f;
-        #pragma unroll
-        for (uint32_t j = 0; j < 6u; j++) {
+        for (uint32_t j = 0; j < n_expert_used; j++) {
             sel[j] = (int32_t)out_idx[j];
             w[j] = out_prob[j];
             sum += out_prob[j];
         }
         sum = fmaxf(sum, 6.103515625e-5f);
-        #pragma unroll
-        for (uint32_t j = 0; j < 6u; j++) w[j] = w[j] / sum * 1.5f;
+        for (uint32_t j = 0; j < n_expert_used; j++) w[j] = w[j] / sum * expert_weight_scale;
     }
 }
 
@@ -7638,18 +7655,22 @@ extern "C" int ds4_gpu_directional_steering_project_tensor(
 }
 extern "C" int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, ds4_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t token, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const ds4_gpu_tensor *logits) {
     if (!selected || !weights || !probs || !logits || !model_map || n_expert_groups > 1u || n_group_used > 0u) return 0;
-    if (n_expert != 256u || n_expert_used != 6u || fabsf(expert_weight_scale - 1.5f) > 1.0e-6f) return 0;
+    if (n_expert == 0u || n_expert > 256u || n_expert_used != 6u || fabsf(expert_weight_scale - 1.5f) > 1.0e-6f) return 0;
+    if (logits->bytes < (uint64_t)n_expert * sizeof(float) ||
+        probs->bytes < (uint64_t)n_expert * sizeof(float) ||
+        selected->bytes < (uint64_t)n_expert_used * sizeof(int32_t) ||
+        weights->bytes < (uint64_t)n_expert_used * sizeof(float)) return 0;
     int32_t tok = (int32_t)token;
     int ok = 1;
     const float *bias = NULL;
     const int32_t *hash = NULL;
     if (ok && has_bias && !hash_mode) {
-        if (bias_offset > model_size || model_size - bias_offset < 256u * sizeof(float)) ok = 0;
-        else bias = (const float *)cuda_model_range_ptr(model_map, bias_offset, 256u * sizeof(float), "router_bias");
+        if (bias_offset > model_size || model_size - bias_offset < (uint64_t)n_expert * sizeof(float)) ok = 0;
+        else bias = (const float *)cuda_model_range_ptr(model_map, bias_offset, (uint64_t)n_expert * sizeof(float), "router_bias");
         if (!bias) ok = 0;
     }
     if (ok && hash_mode) {
-        const uint64_t hash_bytes = (uint64_t)hash_rows * 6u * sizeof(int32_t);
+        const uint64_t hash_bytes = (uint64_t)hash_rows * n_expert_used * sizeof(int32_t);
         if (hash_offset > model_size || hash_bytes > model_size - hash_offset) ok = 0;
         else hash = (const int32_t *)cuda_model_range_ptr(model_map, hash_offset, hash_bytes, "router_hash");
         if (!hash) ok = 0;
@@ -7660,14 +7681,17 @@ extern "C" int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_te
             dim3 block(32, 4, 1);
             router_select_warp_topk_kernel<<<1, block>>>((int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
                                                          bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
+                                                         n_expert, n_expert_used, expert_weight_scale,
                                                          has_bias && !hash_mode, hash_mode);
         } else if (getenv("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT") == NULL) {
             router_select_parallel_kernel<<<1, 256>>>((int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
                                                       bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
+                                                      n_expert, n_expert_used, expert_weight_scale,
                                                       has_bias && !hash_mode, hash_mode);
         } else {
             router_select_kernel<<<1, 1>>>((int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
                                           bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
+                                          n_expert, n_expert_used, expert_weight_scale,
                                           has_bias && !hash_mode, hash_mode);
         }
         ok = cuda_ok(cudaGetLastError(), "router_select launch");
@@ -7675,24 +7699,24 @@ extern "C" int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_te
     return ok;
 }
 extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, ds4_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const ds4_gpu_tensor *logits, const ds4_gpu_tensor *tokens, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_tokens) {
-    if (n_expert != 256u || n_expert_used != 6u || fabsf(expert_weight_scale - 1.5f) > 1.0e-6f) return 0;
+    if (n_expert == 0u || n_expert > 256u || n_expert_used != 6u || fabsf(expert_weight_scale - 1.5f) > 1.0e-6f) return 0;
     if (!selected || !weights || !probs || !logits || !tokens || !model_map || n_tokens == 0 ||
         n_expert_groups > 1u || n_group_used > 0u ||
-        logits->bytes < (uint64_t)n_tokens * 256u * sizeof(float) ||
-        probs->bytes < (uint64_t)n_tokens * 256u * sizeof(float) ||
-        selected->bytes < (uint64_t)n_tokens * 6u * sizeof(int32_t) ||
-        weights->bytes < (uint64_t)n_tokens * 6u * sizeof(float)) {
+        logits->bytes < (uint64_t)n_tokens * n_expert * sizeof(float) ||
+        probs->bytes < (uint64_t)n_tokens * n_expert * sizeof(float) ||
+        selected->bytes < (uint64_t)n_tokens * n_expert_used * sizeof(int32_t) ||
+        weights->bytes < (uint64_t)n_tokens * n_expert_used * sizeof(float)) {
         return 0;
     }
     const float *bias = NULL;
     const int32_t *hash = NULL;
     if (has_bias && !hash_mode) {
-        if (bias_offset > model_size || model_size - bias_offset < 256u * sizeof(float)) return 0;
-        bias = (const float *)cuda_model_range_ptr(model_map, bias_offset, 256u * sizeof(float), "router_bias");
+        if (bias_offset > model_size || model_size - bias_offset < (uint64_t)n_expert * sizeof(float)) return 0;
+        bias = (const float *)cuda_model_range_ptr(model_map, bias_offset, (uint64_t)n_expert * sizeof(float), "router_bias");
         if (!bias) return 0;
     }
     if (hash_mode) {
-        const uint64_t hash_bytes = (uint64_t)hash_rows * 6u * sizeof(int32_t);
+        const uint64_t hash_bytes = (uint64_t)hash_rows * n_expert_used * sizeof(int32_t);
         if (hash_offset > model_size || hash_bytes > model_size - hash_offset) return 0;
         hash = (const int32_t *)cuda_model_range_ptr(model_map, hash_offset, hash_bytes, "router_hash");
         if (!hash) return 0;
@@ -7710,6 +7734,9 @@ extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_
                                                                         0,
                                                                         hash_rows,
                                                                         n_tokens,
+                                                                        n_expert,
+                                                                        n_expert_used,
+                                                                        expert_weight_scale,
                                                                         has_bias && !hash_mode,
                                                                         hash_mode);
     } else if (getenv("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT") == NULL) {
@@ -7723,6 +7750,9 @@ extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_
                                                          0,
                                                          hash_rows,
                                                          n_tokens,
+                                                         n_expert,
+                                                         n_expert_used,
+                                                         expert_weight_scale,
                                                          has_bias && !hash_mode,
                                                          hash_mode);
     } else {
@@ -7736,6 +7766,9 @@ extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_
                                               0,
                                               hash_rows,
                                               n_tokens,
+                                              n_expert,
+                                              n_expert_used,
+                                              expert_weight_scale,
                                               has_bias && !hash_mode,
                                               hash_mode);
     }
@@ -9274,6 +9307,32 @@ __global__ static void moe_down_q4K_sum6_qwarp32_kernel(
     if (lane == 0) out[row] = total;
 }
 
+__global__ static void moe_down_q4K_qwarp32_kernel(
+        float *down_out,
+        const char *down_base,
+        const cuda_block_q8_K *midq,
+        const int32_t *selected,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t midq_blocks,
+        uint32_t out_dim,
+        uint32_t n_expert) {
+    uint32_t lane = threadIdx.x & 7u;
+    uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
+    uint32_t pair = blockIdx.y;
+    if (row >= out_dim) return;
+    uint32_t tok = pair / n_expert;
+    uint32_t slot = pair - tok * n_expert;
+    int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+    if (expert_i < 0) expert_i = 0;
+    const cuda_block_q4_K *wr = (const cuda_block_q4_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
+    const cuda_block_q8_K *xq = midq + (uint64_t)pair * midq_blocks;
+    float acc = 0.0f;
+    for (uint32_t b = lane; b < midq_blocks; b += 8u) acc += dev_dot_q4_K_q8_K_block(wr + b, xq + b);
+    acc = quarter_warp_sum_f32(acc, lane);
+    if (lane == 0) down_out[(uint64_t)pair * out_dim + row] = acc;
+}
+
 __global__ static void moe_down_sorted_qwarp32_kernel(
         float *down_out,
         const char *down_base,
@@ -9916,7 +9975,7 @@ static int routed_moe_launch(
     }
     const int q4k_path = (gate_type == 12u && down_type == 12u);
     if (!q4k_path && (gate_type != 16u || down_type != 10u)) return 0;
-    if (q4k_path && (n_tokens != 1u || n_expert != 6u)) return 0;
+    if (q4k_path && n_expert != 6u) return 0;
     const uint64_t gate_bytes = (uint64_t)n_total_expert * gate_expert_bytes;
     const uint64_t down_bytes = (uint64_t)n_total_expert * down_expert_bytes;
     if (gate_bytes > model_size - gate_offset ||
@@ -9952,7 +10011,7 @@ static int routed_moe_launch(
             if (prof_ev[0]) (void)cudaEventRecord(prof_ev[0], 0);
         }
         const uint32_t pair_count = n_tokens * n_expert;
-        const uint32_t use_sorted_pairs = n_tokens > 1u;
+        const uint32_t use_sorted_pairs = !q4k_path && n_tokens > 1u;
         const uint32_t use_expert_tiles = use_sorted_pairs && getenv("DS4_CUDA_MOE_NO_EXPERT_TILES") == NULL;
         const uint32_t expert_tile_m = getenv("DS4_CUDA_MOE_TILE4") ? 4u : 8u;
         const uint32_t write_gate_up = getenv("DS4_CUDA_MOE_WRITE_GATE_UP") != NULL;
@@ -9971,7 +10030,7 @@ static int routed_moe_launch(
         const uint32_t use_down_tile16 = use_atomic_down && expert_tile_m == 8u &&
             n_tokens >= 128u && getenv("DS4_CUDA_MOE_NO_DOWN_TILE16") == NULL;
         const uint32_t use_decode_lut_gate =
-            n_tokens == 1u && xq_blocks <= 16u &&
+            (q4k_path || (n_tokens == 1u && xq_blocks <= 16u)) &&
             getenv("DS4_CUDA_MOE_NO_DECODE_LUT_GATE") == NULL;
         const uint32_t gate_row_span =
             getenv("DS4_CUDA_MOE_GATE_ROW512") != NULL ? 512u :
@@ -10343,6 +10402,17 @@ static int routed_moe_launch(
                     down_w,
                     midq,
                     sorted_pairs,
+                    (const int32_t *)selected->ptr,
+                    down_expert_bytes,
+                    down_row_bytes,
+                    midq_blocks,
+                    out_dim,
+                    n_expert);
+            } else if (q4k_path) {
+                moe_down_q4K_qwarp32_kernel<<<dgrid, 256>>>(
+                    (float *)down->ptr,
+                    down_w,
+                    midq,
                     (const int32_t *)selected->ptr,
                     down_expert_bytes,
                     down_row_bytes,

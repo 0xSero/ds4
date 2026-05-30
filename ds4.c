@@ -224,6 +224,8 @@ static const ds4_shape DS4_SHAPE_PRO = {
     .rope_orig_ctx = DS4_DEFAULT_ROPE_ORIG_CTX,
 };
 
+static const char *DS4_SHAPE_FLASH_REAP_NAME = "DeepSeek V4 Flash REAP";
+
 static ds4_shape g_ds4_shape = {
     .name = "DeepSeek V4 Flash",
     .variant = DS4_VARIANT_FLASH,
@@ -2782,6 +2784,22 @@ static void ds4_select_shape_from_metadata(
                                    n_indexer_head_dim, n_indexer_top_k, n_hc,
                                    n_hc_sinkhorn_iter)) {
         g_ds4_shape = DS4_SHAPE_PRO;
+        return;
+    }
+
+    if (n_expert > 0 &&
+        n_expert <= DS4_SHAPE_FLASH.n_expert &&
+        ds4_shape_matches_metadata(&DS4_SHAPE_FLASH,
+                                   n_layer, n_embd, n_vocab, n_head, n_head_kv,
+                                   n_head_dim, n_value_dim, n_rot, n_lora_q,
+                                   n_lora_o, n_out_group, DS4_SHAPE_FLASH.n_expert,
+                                   n_expert_used, n_ff_exp, n_expert_shared,
+                                   n_hash_layer, n_swa, n_indexer_head,
+                                   n_indexer_head_dim, n_indexer_top_k, n_hc,
+                                   n_hc_sinkhorn_iter)) {
+        g_ds4_shape = DS4_SHAPE_FLASH;
+        g_ds4_shape.name = DS4_SHAPE_FLASH_REAP_NAME;
+        g_ds4_shape.n_expert = n_expert;
         return;
     }
 

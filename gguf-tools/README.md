@@ -96,6 +96,50 @@ You can override tensor families:
 --output q8_0
 ```
 
+### Generate 0xSero REAP GGUFs
+
+The quantizer also supports REAP-pruned DeepSeek V4 Flash safetensors such as
+`0xSero/DeepSeek-V4-Flash-162B` and `0xSero/DeepSeek-V4-Flash-180B`.  For these
+models, `config.json` supplies the pruned routed-expert count (`144`, `160`,
+etc.); the tool rewrites the DS4 GGUF expert metadata and expert/router tensor
+shapes while keeping the rest of the Flash template layout.
+
+```sh
+gguf-tools/deepseek4-quantize \
+  --hf /path/to/DeepSeek-V4-Flash-180B \
+  --template gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf \
+  --out gguf/DeepSeek-V4-Flash-180B-REAP-ds4-q2.gguf \
+  --experts iq2_xxs \
+  --routed-w2 q2_k \
+  --attention-proj q8_0 \
+  --shared q8_0 \
+  --output q8_0
+```
+
+Use `--dry-run` first; it should report the HF routed expert count rather than
+the template's original 256 experts.  You can override with `--n-experts N` for
+experiments, but normal REAP conversion should not need it.
+
+Spark convenience scripts:
+
+```sh
+# Compact Q2 pair:
+THREADS=8 ./scripts/convert_reap_ggufs.sh
+
+# Larger quality-biased Q4 pair:
+THREADS=8 ./scripts/convert_reap_ggufs_q4_dynamic.sh
+
+# Wait for the detached Q2 Spark job, build Q4-Dynamic, then upload both GGUF
+# repos to Hugging Face with model cards and checksums:
+./scripts/run_reap_gguf_release_pipeline.sh
+```
+
+`Q4-Dynamic` is intentionally mixed precision: routed experts and remaining
+dense 2D tensors use `Q4_K`, while attention/indexer/compressor projections,
+shared experts, embeddings, and output tensors stay at `Q8_0`. This gives a
+larger quality-biased GGUF beside the compact Q2 profile without flattening
+runtime-critical DS4 tensors to Q4.
+
 Useful checks before writing a full model:
 
 ```sh
