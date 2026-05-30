@@ -241,3 +241,16 @@ The model card cites:
       year={2026},
 }
 ```
+
+## REAP Variants (0xSero fork)
+
+This fork also runs REAP-pruned Flash checkpoints, which share every
+architectural fact above except a smaller routed-expert pool (256 → 160/144).
+The active-parameter behavior per token is unchanged: 6 routed experts plus 1
+shared expert. See [REAP.md](REAP.md) for the model lineup, GGUF downloads, and
+conversion pipeline.
+
+| Variant | Routed experts | Source weights |
+|---|---:|---|
+| Flash Spark (180B, K160) | 160 | `0xSero/DeepSeek-V4-Flash-180B` |
+| Flash Spark Mini (162B, K144) | 144 | `0xSero/DeepSeek-V4-Flash-162B` |

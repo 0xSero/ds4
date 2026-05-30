@@ -11,6 +11,12 @@ PRO_FILE="DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct.gguf"
 PRO_IMATRIX_FILE="DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct-imatrix.gguf"
 MTP_FILE="DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf"
 
+# 0xSero REAP DS4 GGUFs live in their own per-model Hugging Face repos.
+SPARK_REPO="0xSero/DeepSeek-V4-Flash-Spark-GGUF"
+SPARK_FILE="DeepSeek-V4-Flash-Spark-Q2-REAP-ds4.gguf"
+SPARK_MINI_REPO="0xSero/DeepSeek-V4-Flash-Spark-Mini-GGUF"
+SPARK_MINI_FILE="DeepSeek-V4-Flash-Spark-Mini-Q2-REAP-ds4.gguf"
+
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 OUT_DIR=${DS4_GGUF_DIR:-"$ROOT/gguf"}
 case "$OUT_DIR" in
@@ -32,6 +38,8 @@ Usage:
   ./download_model.sh pro [--token TOKEN]
   ./download_model.sh pro-imatrix [--token TOKEN]
   ./download_model.sh mtp [--token TOKEN]
+  ./download_model.sh spark [--token TOKEN]
+  ./download_model.sh spark-mini [--token TOKEN]
 
 Targets:
   *** PREFERRED GGUF FILES: USE THE IMATRIX VERSIONS BELOW ***
@@ -70,6 +78,18 @@ Targets:
        It is useful with q2-imatrix, q4-imatrix, q2, and q4, but must be
        enabled explicitly with --mtp when running ds4 or ds4-server.
 
+  0xSero REAP variants (this fork; see REAP.md):
+
+  spark
+       DeepSeek V4 Flash Spark, REAP-pruned to 160 routed experts (K160,
+       "180B"). Compact Q2 DS4 GGUF, about 81 GB on disk, for 96/128 GB
+       machines. From 0xSero/DeepSeek-V4-Flash-Spark-GGUF.
+
+  spark-mini
+       DeepSeek V4 Flash Spark Mini, REAP-pruned to 144 routed experts
+       (K144, "162B"). Compact Q2 DS4 GGUF. From
+       0xSero/DeepSeek-V4-Flash-Spark-Mini-GGUF.
+
 Options:
   --token TOKEN  Hugging Face token. Otherwise HF_TOKEN or the local HF token
                  cache is used if present.
@@ -98,6 +118,9 @@ fi
 MODEL=$1
 shift
 
+# Default repo is antirez's GGUF release; REAP targets override it below.
+MODEL_REPO=$REPO
+
 case "$MODEL" in
     q2-imatrix) MODEL_FILE=$Q2_IMATRIX_FILE ;;
     q2-q4-imatrix) MODEL_FILE=$Q2_Q4_IMATRIX_FILE ;;
@@ -107,6 +130,8 @@ case "$MODEL" in
     pro) MODEL_FILE=$PRO_FILE ;;
     pro-imatrix) MODEL_FILE=$PRO_IMATRIX_FILE ;;
     mtp) MODEL_FILE=$MTP_FILE ;;
+    spark) MODEL_FILE=$SPARK_FILE; MODEL_REPO=$SPARK_REPO ;;
+    spark-mini) MODEL_FILE=$SPARK_MINI_FILE; MODEL_REPO=$SPARK_MINI_REPO ;;
     -h|--help|help)
         usage
         exit 0
@@ -146,7 +171,7 @@ download_one() {
     out="$OUT_DIR/$file"
     part="$out.part"
     aria2_part="$out.aria2"
-    url="https://huggingface.co/$REPO/resolve/main/$file"
+    url="https://huggingface.co/$MODEL_REPO/resolve/main/$file"
 
     mkdir -p "$OUT_DIR"
 
@@ -162,7 +187,7 @@ download_one() {
     fi
 
     echo "Downloading $file"
-    echo "from https://huggingface.co/$REPO"
+    echo "from https://huggingface.co/$MODEL_REPO"
     echo "If the download stops, run the same command again to resume it."
 
     if [ -n "$TOKEN" ]; then

@@ -1,3 +1,41 @@
+<!-- ───────────────────────────────────────────────────────────────────────
+     0xSero/ds4 — REAP fork notice
+     This block is the only change above antirez's original README, which
+     follows unmodified. See REAP.md for the full pruned-model guide.
+     ─────────────────────────────────────────────────────────────────────── -->
+
+# ds4 — 0xSero REAP fork
+
+This repository is a fork of **[antirez/ds4](https://github.com/antirez/ds4)**
+(the "DwarfStar" engine) extended to run **REAP-pruned DeepSeek V4 Flash**
+checkpoints alongside the stock Flash and PRO models. REAP (Router-weighted
+Expert Activation Pruning) drops the least-used routed experts; the result is a
+normal Flash model with a smaller expert pool, so DwarfStar can run it once the
+engine no longer assumes exactly 256 experts.
+
+| Model | Routed experts | Source weights | DS4 GGUF |
+|---|---:|---|---|
+| **Flash Spark** (180B) | 160 / K160 | [DeepSeek-V4-Flash-180B](https://huggingface.co/0xSero/DeepSeek-V4-Flash-180B) | […-Spark-GGUF](https://huggingface.co/0xSero/DeepSeek-V4-Flash-Spark-GGUF) |
+| **Flash Spark Mini** (162B) | 144 / K144 | [DeepSeek-V4-Flash-162B](https://huggingface.co/0xSero/DeepSeek-V4-Flash-162B) | […-Spark-Mini-GGUF](https://huggingface.co/0xSero/DeepSeek-V4-Flash-Spark-Mini-GGUF) |
+
+```sh
+make cuda-spark          # or `make` for Metal, `make cuda-generic` for other CUDA GPUs
+./download_model.sh spark        # or: spark-mini
+./ds4-server --ctx 100000
+```
+
+**What this fork adds:** variable routed-expert support in the engine
+(`ds4.c`, `ds4_cuda.cu`), REAP-aware GGUF quantization
+(`gguf-tools/deepseek4-quantize.c`), and the conversion / upload / validation
+pipeline in [`scripts/`](scripts/). Full guide: **[REAP.md](REAP.md)**. These
+checkpoints are **experimental**. Companion vLLM deployment:
+[0xSero/deepseek-spark](https://github.com/0xSero/deepseek-spark).
+
+All credit for the DwarfStar engine itself belongs to antirez and the
+contributors acknowledged below. The original README continues unchanged:
+
+---
+
 # DwarfStar
 
 **DwarfStar** is a small native inference engine optimized first for
