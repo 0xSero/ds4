@@ -14,8 +14,12 @@ MTP_FILE="DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf"
 # 0xSero REAP DS4 GGUFs live in their own per-model Hugging Face repos.
 SPARK_REPO="0xSero/DeepSeek-V4-Flash-Spark-GGUF"
 SPARK_FILE="DeepSeek-V4-Flash-Spark-Q2-REAP-ds4.gguf"
+SPARK_Q3_FILE="DeepSeek-V4-Flash-Spark-Q3-Dynamic-REAP-ds4.gguf"
+SPARK_Q4_FILE="DeepSeek-V4-Flash-Spark-Q4-Dynamic-REAP-ds4.gguf"
 SPARK_MINI_REPO="0xSero/DeepSeek-V4-Flash-Spark-Mini-GGUF"
 SPARK_MINI_FILE="DeepSeek-V4-Flash-Spark-Mini-Q2-REAP-ds4.gguf"
+SPARK_MINI_Q3_FILE="DeepSeek-V4-Flash-Spark-Mini-Q3-Dynamic-REAP-ds4.gguf"
+SPARK_MINI_Q4_FILE="DeepSeek-V4-Flash-Spark-Mini-Q4-Dynamic-REAP-ds4.gguf"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 OUT_DIR=${DS4_GGUF_DIR:-"$ROOT/gguf"}
@@ -38,8 +42,12 @@ Usage:
   ./download_model.sh pro [--token TOKEN]
   ./download_model.sh pro-imatrix [--token TOKEN]
   ./download_model.sh mtp [--token TOKEN]
-  ./download_model.sh spark [--token TOKEN]
-  ./download_model.sh spark-mini [--token TOKEN]
+  ./download_model.sh spark [--token TOKEN]          # K160 2-bit (default)
+  ./download_model.sh spark-q3 [--token TOKEN]       # K160 3-bit (dynamic)
+  ./download_model.sh spark-q4 [--token TOKEN]       # K160 4-bit (dynamic)
+  ./download_model.sh spark-mini [--token TOKEN]     # K144 2-bit (default)
+  ./download_model.sh spark-mini-q3 [--token TOKEN]  # K144 3-bit (dynamic)
+  ./download_model.sh spark-mini-q4 [--token TOKEN]  # K144 4-bit (dynamic)
 
 Targets:
   *** PREFERRED GGUF FILES: USE THE IMATRIX VERSIONS BELOW ***
@@ -130,8 +138,12 @@ case "$MODEL" in
     pro) MODEL_FILE=$PRO_FILE ;;
     pro-imatrix) MODEL_FILE=$PRO_IMATRIX_FILE ;;
     mtp) MODEL_FILE=$MTP_FILE ;;
-    spark) MODEL_FILE=$SPARK_FILE; MODEL_REPO=$SPARK_REPO ;;
-    spark-mini) MODEL_FILE=$SPARK_MINI_FILE; MODEL_REPO=$SPARK_MINI_REPO ;;
+    spark|spark-q2) MODEL_FILE=$SPARK_FILE; MODEL_REPO=$SPARK_REPO ;;
+    spark-q3) MODEL_FILE=$SPARK_Q3_FILE; MODEL_REPO=$SPARK_REPO ;;
+    spark-q4) MODEL_FILE=$SPARK_Q4_FILE; MODEL_REPO=$SPARK_REPO ;;
+    spark-mini|spark-mini-q2) MODEL_FILE=$SPARK_MINI_FILE; MODEL_REPO=$SPARK_MINI_REPO ;;
+    spark-mini-q3) MODEL_FILE=$SPARK_MINI_Q3_FILE; MODEL_REPO=$SPARK_MINI_REPO ;;
+    spark-mini-q4) MODEL_FILE=$SPARK_MINI_Q4_FILE; MODEL_REPO=$SPARK_MINI_REPO ;;
     -h|--help|help)
         usage
         exit 0
