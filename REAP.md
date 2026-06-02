@@ -54,29 +54,55 @@ These are the only engine edits; the rest of DwarfStar is upstream.
 
 ## Run a pruned model
 
+### One command (DGX Spark)
+
+```sh
+scripts/deploy_spark.sh
+```
+
+[`scripts/deploy_spark.sh`](scripts/deploy_spark.sh) is an idempotent end-to-end
+deploy: it makes sure the CUDA toolkit is present, builds the engine for GB10
+(`make cuda-spark`), downloads a prebuilt DS4 GGUF (disk-aware fallback +
+sha256 verify, resumable), tunes the unified-memory streaming budget, and serves
+the OpenAI-compatible API on `:8000`. It defaults to the 180B/K160 `Q3-Dynamic`
+checkpoint. Override with env vars:
+
+```sh
+MODEL=spark-mini-q3 scripts/deploy_spark.sh   # 162B/K144 instead
+CTX=262144 PORT=8000 scripts/deploy_spark.sh  # bigger context
+SERVE=0 scripts/deploy_spark.sh               # build + download only
+```
+
+Checkpoints larger than RAM are streamed straight from NVMe by the engine's
+host-mapped / direct-IO loader, so the 82 GB Spark Q3 runs even on a 64 GB
+Spark: `DS4_CUDA_WEIGHT_CACHE_LIMIT_GB` bounds the resident weight cache and the
+rest streams on demand. Larger `CTX` means more KV cache and less room to keep
+experts resident, so it trades decode speed for context length.
+
+### Manual
+
 Build the engine for your backend exactly as upstream (`make` for Metal,
 `make cuda-spark` for a DGX Spark, `make cuda-generic` for other CUDA GPUs),
 then download a prebuilt DS4 GGUF and run it:
 
 ```sh
 # 180B / K160 — "Flash Spark"
-./download_model.sh spark
+./download_model.sh spark-q3      # Q3-Dynamic (~82 GB); also: spark (Q2), spark-q4
 ./ds4 -p "Hello"
-./ds4-server --ctx 100000
+./ds4-server --ctx 131072
 
 # 162B / K144 — "Flash Spark Mini"
-./download_model.sh spark-mini
-./ds4-server --ctx 100000
+./download_model.sh spark-mini-q3
+./ds4-server --ctx 131072
 ```
 
 `download_model.sh` links `./ds4flash.gguf` to whichever model you fetched, so
 the default `./ds4` / `./ds4-server` commands pick it up. Each GGUF ships a
 `.sha256` sidecar in its HF repo if you want to verify the download.
 
-Only the compact `Q2-REAP-ds4` profile is published today (≈81 GB class, sized
-for the same 96/128 GB machines as stock Flash Q2). The mixed-precision
-`Q4-Dynamic-REAP-ds4` profile is produced by the conversion pipeline below and
-will be added to the same repos once validated.
+The compact `Q2-REAP-ds4` and quality-biased `Q3-Dynamic-REAP-ds4` profiles are
+published today; the `Q4-Dynamic-REAP-ds4` profile is produced by the conversion
+pipeline below.
 
 ## Build the GGUFs yourself
 
